@@ -1,16 +1,18 @@
-import matplotlib.pyplot as plt
-import numpy as np
-
 import math
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
 
-def extract_posterior_data(trace, matrix_name="A"):
-    stacked = trace.posterior[matrix_name].stack(samples=("chain", "draw"))
-    return stacked.values
+
+def _get_stacked_samples(trace, var_name):
+    return trace.posterior[var_name].stack(samples=("chain", "draw")).values
 
 
-def plot_normalized_histogram(ax, samples, bins, color='teal', alpha=0.8):
+def _get_posterior_mean(trace, var_name):
+    return trace.posterior[var_name].mean(dim=["chain", "draw"]).values
+
+
+def _draw_density_histogram(ax, samples, bins, color="teal", alpha=0.8):
     counts, bin_edges = np.histogram(samples, bins=bins, density=True)
 
     max_count = np.max(counts)
@@ -18,10 +20,10 @@ def plot_normalized_histogram(ax, samples, bins, color='teal', alpha=0.8):
         counts = counts / max_count
 
     ax.fill_between(bin_edges[:-1], counts, step="post", color=color, alpha=alpha, linewidth=0)
-    ax.axhline(0, color='white', alpha=0.1, linewidth=1)
+    ax.axhline(0, color="white", alpha=0.1, linewidth=1)
 
 
-def style_cell_axes(ax, i, j, v_size, alphabet_list):
+def _format_grid_cell_axes(ax, row_idx, col_idx, grid_size, labels):
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1.1)
     ax.set_xticks([])
@@ -30,55 +32,59 @@ def style_cell_axes(ax, i, j, v_size, alphabet_list):
     for spine in ax.spines.values():
         spine.set_visible(False)
 
-    if j == 0:
-        ax.set_ylabel(alphabet_list[i], rotation=0, labelpad=12, fontweight='bold', va='center')
-    if i == v_size - 1:
-        ax.set_xlabel(alphabet_list[j], fontweight='bold')
+    if col_idx == 0:
+        ax.set_ylabel(labels[row_idx], rotation=0, labelpad=12, fontweight="bold", va="center")
+    if row_idx == grid_size - 1:
+        ax.set_xlabel(labels[col_idx], fontweight="bold")
 
 
-def plot_transition_matrix_posterior(trace, param="A", alphabet="abcdefghjklmnopqrs"):
-    alphabet_list = list(alphabet)
-    v_size = len(alphabet_list)
-
-    data = extract_posterior_data(trace, param)
-
-    fig, axes = plt.subplots(v_size, v_size, figsize=(18, 18), sharex=True, sharey=True)
-
-    bins = np.linspace(0, 1, 40)
-
-    for i in range(v_size):
-        for j in range(v_size):
-            ax = axes[i, j]
-            samples = data[i, j, :]
-
-            plot_normalized_histogram(ax, samples, bins)
-            style_cell_axes(ax, i, j, v_size, alphabet_list)
-
-    plt.suptitle(f"Posterior Transition Densities ({param})\nRows: From | Cols: To", fontsize=20)
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    plt.show()
-
-
-
-
-
-def _plot_single_heatmap(ax, matrix, alphabet, mode_index):
+def _draw_heatmap(ax, matrix, labels, title=None):
     sns.heatmap(
         matrix,
-        xticklabels=alphabet,
-        yticklabels=alphabet,
+        xticklabels=labels,
+        yticklabels=labels,
         cmap="binary",
         annot=False,
         ax=ax,
         cbar=False
     )
-    ax.set_title(f"Mode {mode_index}")
+    if title:
+        ax.set_title(title)
     ax.set_xlabel("To Pitch")
     ax.set_ylabel("From Pitch")
 
 
-def plot_posterior_matrices(trace, model, matrix_name="A"):
-    posterior_mean = trace.posterior[matrix_name].mean(dim=["chain", "draw"]).values
+def plot_transition_densities(trace, matrix_name="A", alphabet="abcdefghjklmnopqrs"):
+    labels = list(alphabet)
+    v_size = len(labels)
+    data = _get_stacked_samples(trace, matrix_name)
+    bins = np.linspace(0, 1, 40)
+
+    fig, axes = plt.subplots(v_size, v_size, figsize=(18, 18), sharex=True, sharey=True)
+
+    for i in range(v_size):
+        for j in range(v_size):
+            ax = axes[i, j]
+            _draw_density_histogram(ax, data[i, j, :], bins)
+            _format_grid_cell_axes(ax, i, j, v_size, labels)
+
+    plt.suptitle(f"Posterior Transition Densities ({matrix_name})\nRows: From | Cols: To", fontsize=20)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.show()
+
+
+def plot_mean_heatmap(trace, matrix_name="A_0", alphabet="abcdefghjklmnopqrs"):
+    labels = list(alphabet)
+    posterior_mean = _get_posterior_mean(trace, matrix_name)
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    _draw_heatmap(ax, posterior_mean, labels, title=f"Posterior Mean Transition Matrix ({matrix_name})")
+    plt.show()
+
+
+def plot_mode_heatmaps(trace, matrix_name="A", alphabet="abcdefghjklmnopqrs"):
+    labels = list(alphabet)
+    posterior_mean = _get_posterior_mean(trace, matrix_name)
 
     num_modes = posterior_mean.shape[0]
     cols = 4
@@ -88,7 +94,7 @@ def plot_posterior_matrices(trace, model, matrix_name="A"):
     axes = axes.flatten()
 
     for i in range(num_modes):
-        _plot_single_heatmap(axes[i], posterior_mean[i], model.alphabet, i)
+        _draw_heatmap(axes[i], posterior_mean[i], labels, title=f"Mode {i}")
 
     for j in range(num_modes, len(axes)):
         axes[j].set_visible(False)

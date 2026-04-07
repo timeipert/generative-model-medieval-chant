@@ -5,7 +5,7 @@ import pytensor.tensor as pt
 from models import base_model
 
 
-class Model2(base_model.Model):
+class MarkovModeTransposedModel(base_model.Model):
     def __init__(self, data=None, coords=None):
         super().__init__(data=data, coords=coords)
         self.alpha = np.ones(self.V)
@@ -28,7 +28,7 @@ class Model2(base_model.Model):
     @staticmethod
     def scan_dist(init_state, transition_p, end_t, size):
         states, _ = pytensor.scan(
-            fn=Model2.step_fn,
+            fn=MarkovModeTransposedModel.step_fn,
             sequences=[pt.arange(end_t.max())],
             outputs_info=[init_state],
             non_sequences=[transition_p, end_t],
@@ -62,7 +62,7 @@ class Model2(base_model.Model):
 
     def _calc_conditional_logp(self, x_tm1, x_t, mask, A_0, m_val):
         A_all = pt.stack([
-            Model2.transpose_beta(A_0, pt.as_tensor(i, dtype="int32"))
+            MarkovModeTransposedModel.transpose_beta(A_0, pt.as_tensor(i, dtype="int32"))
             for i in range(self.M)
         ])
 
@@ -73,7 +73,7 @@ class Model2(base_model.Model):
 
     def _calc_marginal_logp(self, x_tm1, x_t, mask, A_0, nu):
         A_all = pt.stack([
-            Model2.transpose_beta(A_0, pt.as_tensor(i, dtype="int32"))
+            MarkovModeTransposedModel.transpose_beta(A_0, pt.as_tensor(i, dtype="int32"))
             for i in range(self.M)
         ])
 
@@ -125,7 +125,7 @@ class Model2(base_model.Model):
                     x_0,
                     transition_p,
                     length,
-                    dist=Model2.scan_dist,
+                    dist=MarkovModeTransposedModel.scan_dist,
                 )
 
         self.model = model

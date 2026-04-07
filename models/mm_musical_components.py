@@ -23,7 +23,7 @@ class MelodicComponentsMarkovModel(base_model.Model):
     @staticmethod
     def scan_dist(init_state, A, end_t, size):
         states, _ = pytensor.scan(
-            fn=MelodicMarkovModel.step_fn,
+            fn=MelodicComponentsMarkovModel.step_fn,
             sequences=[pt.arange(end_t.max())],
             outputs_info=[init_state],
             non_sequences=[A, end_t],
@@ -35,10 +35,8 @@ class MelodicComponentsMarkovModel(base_model.Model):
         i_idx = np.arange(self.V)[:, None]
         j_idx = np.arange(self.V)[None, :]
 
-        # Base probabilities
         base_logits = pm.Normal("base_logits", mu=0, sigma=1.0, shape=(self.V, self.V))
 
-        # preference of smaller intervals (now exponentially penalized)
         interval_dist_sq = (i_idx - j_idx) ** 2
         w_interval = pm.HalfNormal("w_interval", sigma=1.0) # weight with which the penalty affects
 
@@ -64,7 +62,6 @@ class MelodicComponentsMarkovModel(base_model.Model):
                   + (w_direction * direction)
                   )
 
-        # Convert logits to valid probabilities (rows sum to 1)
         A = pm.Deterministic("A", pm.math.softmax(logits, axis=-1))
         return A
 
@@ -104,7 +101,7 @@ class MelodicComponentsMarkovModel(base_model.Model):
                 x_0,
                 A,
                 length,
-                dist=MelodicMarkovModel.scan_dist,
+                dist=MelodicComponentsMarkovModel.scan_dist,
             )
 
         self.model = model

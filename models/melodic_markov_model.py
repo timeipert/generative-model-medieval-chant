@@ -6,7 +6,7 @@ import pytensor.tensor as pt
 from models import base_model
 
 
-class Model1(base_model.Model):
+class MelodicMarkovModel(base_model.Model):
     def __init__(self, data=None, coords=None):
         super().__init__(data=data, coords=coords)
         self.alpha = np.full(self.V, 1.5)
@@ -25,7 +25,7 @@ class Model1(base_model.Model):
     @staticmethod
     def scan_dist(init_state, A, end_t, size):
         states, _ = pytensor.scan(
-            fn=Model1.step_fn,
+            fn=MelodicMarkovModel.step_fn,
             sequences=[pt.arange(end_t.max())],
             outputs_info=[init_state],
             non_sequences=[A, end_t],
@@ -72,7 +72,7 @@ class Model1(base_model.Model):
                 x_0,
                 A,
                 length,
-                dist=Model1.scan_dist,
+                dist=MelodicMarkovModel.scan_dist,
             )
 
         self.model = model
