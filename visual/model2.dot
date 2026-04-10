@@ -1,0 +1,50 @@
+digraph {
+	subgraph cluster18 {
+		pi [label="pi
+~
+Dirichlet" shape=ellipse]
+		label=18 labeljust=r labelloc=b style=rounded
+	}
+	w_repeat [label="w_repeat
+~
+Normal" shape=ellipse]
+	w_register [label="w_register
+~
+Halfnormal" shape=ellipse]
+	length [label="length
+~
+Poisson" shape=ellipse]
+	register_center [label="register_center
+~
+Normal" shape=ellipse]
+	w_direction [label="w_direction
+~
+Normal" shape=ellipse]
+	w_interval [label="w_interval
+~
+Halfnormal" shape=ellipse]
+	x_0 [label="x_0
+~
+Categorical" shape=ellipse]
+	subgraph "cluster18 x 18" {
+		A [label="A
+~
+Deterministic" shape=box]
+		label="18 x 18" labeljust=r labelloc=b style=rounded
+	}
+	subgraph cluster40 {
+		"x_t+1" [label="x_t+1
+~
+CustomDist_x_t+1" shape=ellipse]
+		label=40 labeljust=r labelloc=b style=rounded
+	}
+	w_repeat -> A
+	register_center -> A
+	w_register -> A
+	w_direction -> A
+	w_interval -> A
+	pi -> x_0
+	length -> "x_t+1"
+	A -> "x_t+1"
+	x_0 -> "x_t+1"
+}

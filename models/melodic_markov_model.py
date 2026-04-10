@@ -9,77 +9,90 @@ from models import base_model
 class MelodicMarkovModel(base_model.Model):
     def __init__(self, data=None, coords=None):
         super().__init__(data=data, coords=coords)
-        self.alpha = np.full(self.V, 1.5)
-        self.beta = np.full((self.V, self.V), 1.5)
+        self.alpha_prior = np.full(self.V, 1.5)
+        self.beta_prior = np.full((self.V, self.V), 1.5)
 
     @staticmethod
-    def step_fn(t, state_tm1, A, end_t):
-        state_t = pm.Categorical.dist(p=A[state_tm1])
+    def _scan_step_fn(current_time, prev_state, transition_matrix, sequence_lengths):
+        current_state = pm.Categorical.dist(p=transition_matrix[prev_state])
 
-        # variable length like here: https://discourse.pymc.io/t/using-discretemarkovchain-with-batch-dimensions-and-data-of-different-lengths/16611/2
-        end_state = pm.DiracDelta.dist(-1, shape=state_t.shape)
-        state_t = pt.where(t >= end_t, end_state, state_t)
+        # Inject absorbing state (-1) when sequence length is reached
+        # See: https://discourse.pymc.io/t/using-discretemarkovchain-with-batch-dimensions-and-data-of-different-lengths/16611/2
+        absorbing_state = pm.DiracDelta.dist(-1, shape=current_state.shape)
+        current_state = pt.where(current_time >= sequence_lengths, absorbing_state, current_state)
 
-        return state_t, collect_default_updates([state_t])
+        return current_state, collect_default_updates([current_state])
 
     @staticmethod
-    def scan_dist(init_state, A, end_t, size):
+    def _scan_generative_dist(initial_state, transition_matrix, sequence_lengths, size):
         states, _ = pytensor.scan(
-            fn=MelodicMarkovModel.step_fn,
-            sequences=[pt.arange(end_t.max())],
-            outputs_info=[init_state],
-            non_sequences=[A, end_t],
+            fn=MelodicMarkovModel._scan_step_fn,
+            sequences=[pt.arange(sequence_lengths.max())],
+            outputs_info=[initial_state],
+            non_sequences=[transition_matrix, sequence_lengths],
             strict=True,
         )
         return states
 
-    def build_inference_model(self, x_0_obs, x_t_obs, lengths_obs, **kwargs):
-        with pm.Model() as model:
-            pi = pm.Dirichlet("pi", a=self.alpha)
-            A = pm.Dirichlet("A", a=self.beta)
+    def _define_priors(self):
+        init_probs = pm.Dirichlet("init_probs", a=self.alpha_prior)
+        transition_matrix = pm.Dirichlet("transition_matrix", a=self.beta_prior)
 
-            pm.Categorical("x_0", p=pi, observed=x_0_obs)
+        return init_probs, transition_matrix
 
-            x_0_reshaped = pt.shape_padleft(x_0_obs)
-            x_full = pt.concatenate([x_0_reshaped, x_t_obs], axis=0)
-            x_tm1 = x_full[:-1]
-            x_t = x_full[1:]
+    def _define_inference_likelihood(self, init_probs, transition_matrix, initial_states_obs, sequence_states_obs,
+                                     sequence_lengths_obs):
+        pm.Categorical("initial_states", p=init_probs, observed=initial_states_obs)
 
-            # Mask for variable length
-            t_idx = pt.arange(x_t_obs.shape[0])
-            mask = t_idx[:, None] < lengths_obs[None, :]
+        initial_states_padded = pt.shape_padleft(initial_states_obs)
+        all_states = pt.concatenate([initial_states_padded, sequence_states_obs], axis=0)
 
-            valid_x_tm1 = x_tm1[mask]
-            valid_x_t = x_t[mask]
+        states_t_minus_1 = all_states[:-1]
+        states_t = all_states[1:]
 
-            pm.Categorical("transitions", p=A[valid_x_tm1], observed=valid_x_t)
+        time_indices = pt.arange(sequence_states_obs.shape[0])
+        valid_time_mask = time_indices[:, None] < sequence_lengths_obs[None, :]
 
-        self.model = model
-        return model
+        valid_prev_states = states_t_minus_1[valid_time_mask]
+        valid_current_states = states_t[valid_time_mask]
 
+        pm.Categorical(
+            "transitions",
+            p=transition_matrix[valid_prev_states],
+            observed=valid_current_states
+        )
 
+    def _define_generative_likelihood(self, init_probs, transition_matrix):
+        initial_states = pm.Categorical("initial_states", p=init_probs)
+        sequence_lengths = pm.Poisson("sequence_lengths", self.mean_seq_len)
 
-    def build_generative_model(self, **kwargs):
-        with pm.Model() as model:
-            pi = pm.Dirichlet("pi", a=self.alpha)
-            A = pm.Dirichlet("A", a=self.beta)
+        pm.CustomDist(
+            "generated_sequence",
+            initial_states,
+            transition_matrix,
+            sequence_lengths,
+            dist=MelodicMarkovModel._scan_generative_dist,
+        )
 
-            x_0 = pm.Categorical("x_0", p=pi)
-            length = pm.Poisson("length", self.mean_seq_len)
+    def build_model(self, initial_states_obs=None, sequence_states_obs=None, sequence_lengths_obs=None, **kwargs):
+        # Passing coords directly to Model context if they exist in base_model
+        coords = getattr(self, "coords", None)
 
-            pm.CustomDist(
-                "x_t+1",
-                x_0,
-                A,
-                length,
-                dist=MelodicMarkovModel.scan_dist,
-            )
+        with pm.Model(coords=coords) as self.model:
+            init_probs, transition_matrix = self._define_priors()
 
-        self.model = model
-        return model
+            if sequence_states_obs is not None:
+                self._define_inference_likelihood(
+                    init_probs,
+                    transition_matrix,
+                    initial_states_obs,
+                    sequence_states_obs,
+                    sequence_lengths_obs
+                )
+            else:
+                self._define_generative_likelihood(
+                    init_probs,
+                    transition_matrix
+                )
 
-    def build_model(self, x_0_obs=None, x_t_obs=None, lengths_obs=None, **kwargs):
-        if x_t_obs is not None:
-            return self.build_inference_model(x_0_obs, x_t_obs, lengths_obs, **kwargs)
-        else:
-            return self.build_generative_model(**kwargs)
+        return self.model

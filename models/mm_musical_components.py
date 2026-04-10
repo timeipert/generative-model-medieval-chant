@@ -9,106 +9,116 @@ from models import base_model
 class MelodicComponentsMarkovModel(base_model.Model):
     def __init__(self, data=None, coords=None):
         super().__init__(data=data, coords=coords)
-        self.alpha = np.full(self.V, 1.5)
+        self.init_probs_prior = np.full(self.V, 1.5)
 
     @staticmethod
-    def step_fn(t, state_tm1, A, end_t):
-        state_t = pm.Categorical.dist(p=A[state_tm1])
+    def _scan_step_fn(current_time, prev_state, transition_matrix, sequence_lengths):
+        current_state = pm.Categorical.dist(p=transition_matrix[prev_state])
 
-        end_state = pm.DiracDelta.dist(-1, shape=state_t.shape)
-        state_t = pt.where(t >= end_t, end_state, state_t)
+        # See: https://discourse.pymc.io/t/using-discretemarkovchain-with-batch-dimensions-and-data-of-different-lengths/16611/2
+        absorbing_state = pm.DiracDelta.dist(-1, shape=current_state.shape)
+        current_state = pt.where(current_time >= sequence_lengths, absorbing_state, current_state)
 
-        return state_t, collect_default_updates([state_t])
+        return current_state, collect_default_updates([current_state])
 
     @staticmethod
-    def scan_dist(init_state, A, end_t, size):
+    def _scan_generative_dist(initial_state, transition_matrix, sequence_lengths, size):
         states, _ = pytensor.scan(
-            fn=MelodicComponentsMarkovModel.step_fn,
-            sequences=[pt.arange(end_t.max())],
-            outputs_info=[init_state],
-            non_sequences=[A, end_t],
+            fn=MelodicComponentsMarkovModel._scan_step_fn,
+            sequences=[pt.arange(sequence_lengths.max())],
+            outputs_info=[initial_state],
+            non_sequences=[transition_matrix, sequence_lengths],
             strict=True,
         )
         return states
 
-    def _build_transition_matrix(self):
-        i_idx = np.arange(self.V)[:, None]
-        j_idx = np.arange(self.V)[None, :]
+    def _build_transition_matrix_components(self):
+        from_pitch_idx = np.arange(self.V)[:, None]
+        to_pitch_idx = np.arange(self.V)[None, :]
 
         base_logits = pm.Normal("base_logits", mu=0, sigma=1.0, shape=(self.V, self.V))
 
-        interval_dist_sq = (i_idx - j_idx) ** 2
-        w_interval = pm.HalfNormal("w_interval", sigma=1.0) # weight with which the penalty affects
+        interval_dist_sq = (from_pitch_idx - to_pitch_idx) ** 2
+        weight_interval = pm.HalfNormal("weight_interval", sigma=1.0)
 
-        # Prefer specific register
-        # starting with assumption V / 4..
         register_center = pm.Normal("register_center", mu=self.V / 4.0, sigma=self.V / 4.0)
-        pitch_dist_sq = (j_idx - register_center) ** 2
-        w_register = pm.HalfNormal("w_register", sigma=1.0)
+        pitch_dist_sq = (to_pitch_idx - register_center) ** 2
+        weight_register = pm.HalfNormal("weight_register", sigma=1.0)
 
-        # repeated note?
-        is_repeat = (i_idx == j_idx).astype(float)
-        w_repeat = pm.Normal("w_repeat", mu=0, sigma=1.0)
+        is_repeat = (from_pitch_idx == to_pitch_idx).astype(float)
+        weight_repeat = pm.Normal("weight_repeat", mu=0, sigma=1.0)
 
-        # which direction?
-        direction = np.sign(j_idx - i_idx).astype(float)
-        w_direction = pm.Normal("w_direction", mu=0, sigma=1.0)
+        direction = np.sign(to_pitch_idx - from_pitch_idx).astype(float)
+        weight_direction = pm.Normal("weight_direction", mu=0, sigma=1.0)
 
-        # combine all components
-        logits = (base_logits
-                  - (w_interval * interval_dist_sq)
-                  - (w_register * pitch_dist_sq)
-                  + (w_repeat * is_repeat)
-                  + (w_direction * direction)
-                  )
+        logits = (
+                base_logits
+                - (weight_interval * interval_dist_sq)
+                - (weight_register * pitch_dist_sq)
+                + (weight_repeat * is_repeat)
+                + (weight_direction * direction)
+        )
 
-        A = pm.Deterministic("A", pm.math.softmax(logits, axis=-1))
-        return A
+        return pm.Deterministic("transition_matrix", pm.math.softmax(logits, axis=-1))
 
-    def build_inference_model(self, x_0_obs, x_t_obs, lengths_obs, **kwargs):
-        with pm.Model() as model:
-            pi = pm.Dirichlet("pi", a=self.alpha)
-            A = self._build_transition_matrix()
+    def _define_priors(self):
+        init_probs = pm.Dirichlet("init_probs", a=self.init_probs_prior)
+        transition_matrix = self._build_transition_matrix_components()
 
-            pm.Categorical("x_0", p=pi, observed=x_0_obs)
+        return init_probs, transition_matrix
 
-            x_0_reshaped = pt.shape_padleft(x_0_obs)
-            x_full = pt.concatenate([x_0_reshaped, x_t_obs], axis=0)
-            x_tm1 = x_full[:-1]
-            x_t = x_full[1:]
+    def _define_inference_likelihood(self, init_probs, transition_matrix, initial_states_obs, sequence_states_obs,
+                                     sequence_lengths_obs):
+        pm.Categorical("initial_states", p=init_probs, observed=initial_states_obs)
 
-            t_idx = pt.arange(x_t_obs.shape[0])
-            mask = t_idx[:, None] < lengths_obs[None, :]
+        initial_states_padded = pt.shape_padleft(initial_states_obs)
+        all_states = pt.concatenate([initial_states_padded, sequence_states_obs], axis=0)
 
-            valid_x_tm1 = x_tm1[mask]
-            valid_x_t = x_t[mask]
+        prev_states = all_states[:-1]
+        current_states = all_states[1:]
 
-            pm.Categorical("transitions", p=A[valid_x_tm1], observed=valid_x_t)
+        time_indices = pt.arange(sequence_states_obs.shape[0])
+        valid_time_mask = time_indices[:, None] < sequence_lengths_obs[None, :]
 
-        self.model = model
-        return model
+        valid_prev_states = prev_states[valid_time_mask]
+        valid_current_states = current_states[valid_time_mask]
 
-    def build_generative_model(self, **kwargs):
-        with pm.Model() as model:
-            pi = pm.Dirichlet("pi", a=self.alpha)
-            A = self._build_transition_matrix()
+        pm.Categorical(
+            "transitions",
+            p=transition_matrix[valid_prev_states],
+            observed=valid_current_states
+        )
 
-            x_0 = pm.Categorical("x_0", p=pi)
-            length = pm.Poisson("length", self.mean_seq_len)
+    def _define_generative_likelihood(self, init_probs, transition_matrix):
+        initial_states = pm.Categorical("initial_states", p=init_probs)
+        sequence_lengths = pm.Poisson("sequence_lengths", self.mean_seq_len)
 
-            pm.CustomDist(
-                "x_t+1",
-                x_0,
-                A,
-                length,
-                dist=MelodicComponentsMarkovModel.scan_dist,
-            )
+        pm.CustomDist(
+            "generated_sequence",
+            initial_states,
+            transition_matrix,
+            sequence_lengths,
+            dist=MelodicComponentsMarkovModel._scan_generative_dist,
+        )
 
-        self.model = model
-        return model
+    def build_model(self, initial_states_obs=None, sequence_states_obs=None, sequence_lengths_obs=None, **kwargs):
+        coords = getattr(self, "coords", None)
 
-    def build_model(self, x_0_obs=None, x_t_obs=None, lengths_obs=None, **kwargs):
-        if x_t_obs is not None:
-            return self.build_inference_model(x_0_obs, x_t_obs, lengths_obs, **kwargs)
-        else:
-            return self.build_generative_model(**kwargs)
+        with pm.Model(coords=coords) as self.model:
+            init_probs, transition_matrix = self._define_priors()
+
+            if sequence_states_obs is not None:
+                self._define_inference_likelihood(
+                    init_probs,
+                    transition_matrix,
+                    initial_states_obs,
+                    sequence_states_obs,
+                    sequence_lengths_obs
+                )
+            else:
+                self._define_generative_likelihood(
+                    init_probs,
+                    transition_matrix
+                )
+
+        return self.model

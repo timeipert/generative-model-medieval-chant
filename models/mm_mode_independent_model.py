@@ -1,4 +1,5 @@
 import pymc as pm
+from pymc.pytensorf import collect_default_updates
 import numpy as np
 import pytensor
 import pytensor.tensor as pt
@@ -8,82 +9,115 @@ from models import base_model
 class MarkovModeIndependentModel(base_model.Model):
     def __init__(self, data=None, coords=None):
         super().__init__(data=data, coords=coords)
-        self.alpha = np.ones(self.V)
-        self.beta = np.ones((self.V, self.V))
-        self.M = 8
+        self.init_probs_prior = np.ones(self.V)
+        self.transition_prior = np.ones((self.V, self.V))
+        self.num_modes = 8
 
     @staticmethod
-    def step_fn(t, state_tm1, transition_p, end_t):
-        V = transition_p.shape[0]
-        idx = pt.clip(state_tm1, 0, V - 1)
+    def _scan_step_fn(current_time, prev_state, transition_matrix, sequence_lengths):
+        num_states = transition_matrix.shape[0]
+        valid_prev_state = pt.clip(prev_state, 0, num_states - 1)
 
-        state_t = pm.Categorical.dist(p=transition_p[idx])
+        current_state = pm.Categorical.dist(p=transition_matrix[valid_prev_state])
 
-        # variable length like here: https://discourse.pymc.io/t/using-discretemarkovchain-with-batch-dimensions-and-data-of-different-lengths/16611/2
-        end_state = pm.DiracDelta.dist(-1, shape=state_t.shape)
-        state_t = pt.where(t >= end_t, end_state, state_t)
+        absorbing_state = pm.DiracDelta.dist(-1, shape=current_state.shape)
+        current_state = pt.where(current_time >= sequence_lengths, absorbing_state, current_state)
 
-        return state_t, pm.pytensorf.collect_default_updates([state_t])
+        return current_state, collect_default_updates([current_state])
 
     @staticmethod
-    def scan_dist(init_state, transition_p, end_t, size):
+    def _scan_generative_dist(initial_state, transition_matrix, sequence_lengths, size):
         states, _ = pytensor.scan(
-            fn=MarkovModeIndependentModel.step_fn,
-            sequences=[pt.arange(end_t.max())],
-            outputs_info=[init_state],
-            non_sequences=[transition_p, end_t],
+            fn=MarkovModeIndependentModel._scan_step_fn,
+            sequences=[pt.arange(sequence_lengths.max())],
+            outputs_info=[initial_state],
+            non_sequences=[transition_matrix, sequence_lengths],
             strict=True,
         )
         return states
 
-    def _calc_conditional_logp(self, x_tm1, x_t, mask, A, m_val):
-        m_b = pt.alloc(m_val, x_tm1.shape[0], m_val.shape[0])
-        step_logps = pt.log(A[m_b, x_tm1, x_t])
+    def _calculate_sequence_logp(self, prev_states, current_states, valid_time_mask, mode_transition_matrices,
+                                 mode_indices):
+        mode_broadcasted = pt.alloc(mode_indices, prev_states.shape[0], mode_indices.shape[0])
+        step_log_probs = pt.log(mode_transition_matrices[mode_broadcasted, prev_states, current_states])
 
-        return pt.sum(step_logps * mask)
+        return pt.sum(step_log_probs * valid_time_mask)
 
+    def _define_priors(self):
+        mode_probs = pm.Dirichlet("mode_probs", a=np.ones(self.num_modes))
 
-    def build_model(self, x_0_obs=None, x_t_obs=None, lengths_obs=None, m_obs=None, **kwargs):
-        with pm.Model() as model:
-            nu = pm.Dirichlet("nu", a=np.ones(self.M))
+        beta_expanded = np.tile(self.transition_prior, (self.num_modes, 1, 1))
+        mode_transition_matrices = pm.Dirichlet("mode_transition_matrices", a=beta_expanded)
 
-            beta_m = np.tile(self.beta, (self.M, 1, 1))
-            A = pm.Dirichlet("A", a=beta_m)
-            pi = pm.Dirichlet("pi", a=self.alpha)
+        init_probs = pm.Dirichlet("init_probs", a=self.init_probs_prior)
 
-            if x_t_obs is not None:
-                pm.Categorical("x_0", p=pi, observed=x_0_obs)
+        return mode_probs, mode_transition_matrices, init_probs
 
-                x_0_reshaped = pt.shape_padleft(x_0_obs)
-                x_full = pt.concatenate([x_0_reshaped, x_t_obs], axis=0)
-                x_tm1 = x_full[:-1]
-                x_t = x_full[1:]
+    def _define_inference_likelihood(self, mode_probs, mode_transition_matrices, init_probs, initial_states_obs,
+                                     sequence_states_obs, sequence_lengths_obs, mode_obs):
+        pm.Categorical("initial_states", p=init_probs, observed=initial_states_obs)
 
-                t_idx = pt.arange(x_t_obs.shape[0])
-                mask = t_idx[:, None] < lengths_obs[None, :]
+        initial_states_padded = pt.shape_padleft(initial_states_obs)
+        all_states = pt.concatenate([initial_states_padded, sequence_states_obs], axis=0)
 
-                pm.Categorical("m", p=nu, observed=m_obs)
-                seq_ll = self._calc_conditional_logp(x_tm1, x_t, mask, A, m_obs)
-                pm.Potential("conditional_ll", seq_ll)
+        prev_states = all_states[:-1]
+        current_states = all_states[1:]
 
+        time_indices = pt.arange(sequence_states_obs.shape[0])
+        valid_time_mask = time_indices[:, None] < sequence_lengths_obs[None, :]
 
+        pm.Categorical("mode", p=mode_probs, observed=mode_obs)
+
+        sequence_log_likelihood = self._calculate_sequence_logp(
+            prev_states,
+            current_states,
+            valid_time_mask,
+            mode_transition_matrices,
+            mode_obs
+        )
+        pm.Potential("conditional_sequence_ll", sequence_log_likelihood)
+
+    def _define_generative_likelihood(self, mode_probs, mode_transition_matrices, init_probs, mode_obs=None):
+        if mode_obs is not None:
+            mode = pm.Categorical("mode", p=mode_probs, observed=mode_obs)
+        else:
+            mode = pm.Categorical("mode", p=mode_probs)
+
+        active_transition_matrix = pm.Deterministic("active_transition_matrix", mode_transition_matrices[mode])
+        initial_states = pm.Categorical("initial_states", p=init_probs)
+        sequence_lengths = pm.Poisson("sequence_lengths", self.mean_seq_len)
+
+        pm.CustomDist(
+            "generated_sequence",
+            initial_states,
+            active_transition_matrix,
+            sequence_lengths,
+            dist=MarkovModeIndependentModel._scan_generative_dist,
+        )
+
+    def build_model(self, initial_states_obs=None, sequence_states_obs=None, sequence_lengths_obs=None, mode_obs=None,
+                    **kwargs):
+        coords = getattr(self, "coords", None)
+
+        with pm.Model(coords=coords) as self.model:
+            mode_probs, mode_transition_matrices, init_probs = self._define_priors()
+
+            if sequence_states_obs is not None:
+                self._define_inference_likelihood(
+                    mode_probs,
+                    mode_transition_matrices,
+                    init_probs,
+                    initial_states_obs,
+                    sequence_states_obs,
+                    sequence_lengths_obs,
+                    mode_obs
+                )
             else:
-                if m_obs is not None:
-                    m = pm.Categorical("m", p=nu, observed=m_obs)
-                else:
-                    m = pm.Categorical("m", p=nu)
-
-                transition_p = pm.Deterministic("A_m", A[m])
-                x_0 = pm.Categorical("x_0", p=pi)
-                length = pm.Poisson("length", self.mean_seq_len)
-
-                pm.CustomDist(
-                    "x_t+1",
-                    x_0,
-                    transition_p,
-                    length,
-                    dist=MarkovModeIndependentModel.scan_dist,
+                self._define_generative_likelihood(
+                    mode_probs,
+                    mode_transition_matrices,
+                    init_probs,
+                    mode_obs
                 )
 
-        self.model = model
-        return model
+        return self.model

@@ -1,19 +1,11 @@
-import os
-import glob
-import time
 import datetime
 from abc import ABC, abstractmethod
-
+from pathlib import Path
 import pandas as pd
-import numpy as np
 import pymc as pm
 import arviz as az
-import pytensor
-import pytensor.tensor as pt
 from IPython.core.display import HTML
-
 from models import model_utils
-
 
 class Model(ABC):
     def __init__(self, data=None, coords=None, description=""):
@@ -28,43 +20,46 @@ class Model(ABC):
         self.num_modes = 0
         self.description = description
         self.model_name = self.__class__.__name__
-        self.sample_dir = "samples"
+        self.sample_dir = Path("samples")
 
     @abstractmethod
     def build_model(self, x_0_obs=None, x_t_obs=None, lengths_obs=None, **kwargs):
         pass
 
     def _get_filename(self, description=""):
-        desc = description or self.description
-        desc_str = f"_{desc}" if desc else ""
-        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-        return os.path.join(self.sample_dir, f"{self.model_name}{desc_str}_{ts}.nc")
+        active_desc = description or self.description
+        desc_suffix = f"_{active_desc}" if active_desc else ""
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        return self.sample_dir / f"{self.model_name}{desc_suffix}_{timestamp}.nc"
 
     def _get_latest_filepath(self, description=""):
-        desc = description or self.description
-        desc_str = f"_{desc}" if desc else ""
-        pattern = os.path.join(self.sample_dir, f"{self.model_name}{desc_str}_*.nc")
-        files = glob.glob(pattern)
+        active_desc = description or self.description
+        desc_suffix = f"_{active_desc}" if active_desc else ""
+        pattern = f"{self.model_name}{desc_suffix}_*.nc"
 
-        if not files:
+        matching_files = list(self.sample_dir.glob(pattern))
+
+        if not matching_files:
             return None
 
-        return max(files, key=os.path.getctime)
+        return max(matching_files, key=lambda path: path.stat().st_ctime)
 
     def save(self, description=""):
         if self.trace is None:
             raise ValueError("No trace to save. Fit the model first.")
 
-        os.makedirs(self.sample_dir, exist_ok=True)
+        self.sample_dir.mkdir(parents=True, exist_ok=True)
         filepath = self._get_filename(description)
         self.trace.to_netcdf(filepath)
-        return filepath
+
+        return str(filepath)
 
     def load(self, filepath=None, description=""):
         if filepath is None:
             filepath = self._get_latest_filepath(description)
 
-        if filepath is None or not os.path.exists(filepath):
+        if filepath is None or not Path(filepath).exists():
             raise FileNotFoundError("No matching trace file found to load.")
 
         self.trace = az.from_netcdf(filepath)
@@ -78,11 +73,16 @@ class Model(ABC):
                 pass
 
         if self.model is None or data_dict:
-            data_dict = data_dict or {}
-            self.build_model(**data_dict)
+            model_inputs = data_dict or {}
+            self.build_model(**model_inputs)
 
         with self.model:
-            self.trace = pm.sample(draws=draws, tune=tune, **kwargs)
+            self.trace = pm.sample(
+                draws=draws,
+                tune=tune,
+                idata_kwargs={"log_likelihood": True},
+                **kwargs
+            )
 
         if not backup:
             self.save(description=description)
@@ -94,30 +94,44 @@ class Model(ABC):
 
     def prior_predict(self, n_samples=1):
         with self.model:
-            samples = []
-            for _ in range(n_samples):
-                samples.append(pm.sample_prior_predictive(draws=1).prior)
-        return samples
+            idata = pm.sample_prior_predictive(draws=n_samples)
+
+        prior_dataset = idata.prior
+        return [prior_dataset.sel(draw=i, chain=0) for i in range(n_samples)]
 
     def pitches(self, sample, reverse=True):
-        pitch_0 = sample["x_0"].to_series()
-        pitch_series = sample["x_t+1"].to_series()
-        sequence = pd.concat([pitch_0, pitch_series])
-        melody = "-".join(self.alphabet[pitch] for pitch in sequence)
+        initial_pitch = sample["x_0"].to_series()
+        sequence_pitches = sample["x_t+1"].to_series()
+        full_sequence = pd.concat([initial_pitch, sequence_pitches])
+
+        melody_string = "-".join(self.alphabet[pitch] for pitch in full_sequence)
+
         if reverse:
-            melody = melody[::-1]
-        return melody
+            return melody_string[::-1]
+
+        return melody_string
 
     def show_melody(self, sample, reverse=True):
-        return HTML(
-            f"<div style='font-family:Volpiano;font-size:3em;padding:2em;display:flex;justify-content:center;align-items:center;'>{self.pitches(sample, reverse)}</div>"
+        melody_string = self.pitches(sample, reverse)
+        container_style = (
+            "font-family:Volpiano; "
+            "font-size:3em; "
+            "padding:2em; "
+            "display:flex; "
+            "justify-content:center; "
+            "align-items:center;"
         )
 
+        return HTML(f"<div style='{container_style}'>{melody_string}</div>")
+
     def A(self, samples, heatmap=False):
+        target_dataset = samples.prior if hasattr(samples, "prior") else samples
+        avg_matrix = target_dataset.A.mean(dim=["chain", "draw"])
+
         if heatmap:
-            model_utils.plot_heatmap(samples.A.mean(chain=0, draw=0))
+            model_utils.plot_heatmap(avg_matrix)
         else:
-            return samples.prior.A.mean(chain=0, draw=0)
+            return avg_matrix
 
     def predict(self, points):
         pass
