@@ -46,7 +46,7 @@ class MelodicComponentsRegionModeModel(base_model.Model):
         from_pitch_idx = np.arange(self.V)[:, None]
         to_pitch_idx = np.arange(self.V)[None, :]
 
-        base_logits = pm.Normal("base_logits", mu=0, sigma=1.0, shape=(*param_shape, self.V, self.V))
+        #base_logits = pm.Normal("base_logits", mu=0, sigma=1.0, shape=(*param_shape, self.V, self.V))
 
         weight_interval = pm.HalfNormal("weight_interval", sigma=1.0, shape=param_shape)
         weight_register = pm.HalfNormal("weight_register", sigma=1.0, shape=param_shape)
@@ -66,7 +66,7 @@ class MelodicComponentsRegionModeModel(base_model.Model):
         direction = np.sign(to_pitch_idx - from_pitch_idx).astype(float)
 
         logits = (
-                base_logits
+                #base_logits
                 - (w_int_exp * interval_dist_sq)
                 - (w_reg_exp * pitch_dist_sq)
                 + (w_rep_exp * is_repeat)
